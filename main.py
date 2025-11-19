@@ -131,7 +131,8 @@ async def handle_option_click(update: Update, context: CallbackContext):
             cursor.execute(query_sql, (username,))
             perfil = cursor.fetchone()
             perfil = perfil[0] if perfil else None
-            
+            print(f"Perfil obtenido: {repr(perfil)}")
+            print(f"Longitud: {len(perfil)}")
             if perfil != "Administrador(Sistemas)":
                 await query.message.reply_text("❌ No tienes permisos para generar el reporte.")
                 await show_options(update, context)
@@ -276,7 +277,20 @@ async def handle_add_centro_costo(update: Update, context: CallbackContext):
     SELECT P.Nombre 
     FROM Users U
     JOIN Perfil P ON U.Cod_Perfil = P.Cod_Perfil
-    WHERE U.Usuario = ? AND P.Nombre IN ('Auditor Local', 'Auditor Administrador', 'Gerente Local');"""
+    WHERE U.Usuario = ? AND P.Nombre IN (
+        'Administrador(Sistemas)',
+        'Gerente Operaciones',
+        'Auditor Local',
+        'Auditor Administrador',
+        'Gerente Operaciones Nac',
+        'Planta Devoluciones y Pedidos',
+        'Sistemas Tercer Nivel',
+        'Administrador Recetas',
+        'CAR Mayores Contables PyG Presupuesto',
+        'Gerente Local',
+        'Gerente Tienda'
+    );
+    """
     
     cursor.execute(query_sql, (context.user_data["user"],))
     result = cursor.fetchone()
@@ -298,6 +312,7 @@ async def handle_add_centro_costo(update: Update, context: CallbackContext):
         cursor.execute(query_perfil, (context.user_data["user"],))
         perfil = cursor.fetchone()
         perfil = perfil[0]
+        context.user_data["perfil"] = perfil
         
         query_registros = """
         SELECT COUNT(*) AS total_registros FROM UserRestaurante UR
@@ -307,6 +322,15 @@ async def handle_add_centro_costo(update: Update, context: CallbackContext):
         cursor.execute(query_registros, (context.user_data["user"],))
         registros = cursor.fetchone()
         registros = registros[0]
+        
+        # Validación para Gerente Local y Gerente Tienda
+        if perfil.strip() in ("Gerente Local", "Gerente Tienda") and registros >= 2:
+            await update.message.reply_text(
+                f"⛔ El usuario con perfil '{perfil}' ya tiene {registros} centro(s) de costo registrado.\n"
+                "No se permite agregar más centros de costo para este tipo de perfil."
+            )
+            await show_options(update, context)
+            return ASK_OPTIONS
         
         await update.message.reply_text(
             f"El usuario:\n{context.user_data['user']}\n"
@@ -323,13 +347,14 @@ async def handle_add_centro_costo(update: Update, context: CallbackContext):
 
 #########----------------------------------------------------------------Confirmacion de nuevo centro de costo------------------------------------------------------------------------------------------
 async def recibir_cod_tienda(update: Update, context: CallbackContext):
-    
-    cod_tienda = update.message.text
+    cod_tienda = update.message.text.strip()
     context.user_data["cod_tienda"] = cod_tienda
     db_connection = conectarsql()
     cursor = db_connection.cursor()
 
-    query_sql = """SELECT UR.*
+    # 1) Verificar si el centro ya está asignado al usuario objetivo
+    query_sql = """
+        SELECT UR.*
         FROM users U
         JOIN UserRestaurante UR ON U.Cod_Usuario = UR.Cod_Usuario
         JOIN Restaurante R ON UR.Cod_Restaurante = R.Cod_Restaurante
@@ -337,76 +362,116 @@ async def recibir_cod_tienda(update: Update, context: CallbackContext):
     """
     cursor.execute(query_sql, (context.user_data["user"], cod_tienda))
     result1 = cursor.fetchone()
-
     if result1:
         await update.message.reply_text("Este centro de costo ya está asignado. Inténtalo nuevamente.")
-        return ASK_COD_TIENDA  
+        return ASK_COD_TIENDA
 
-    queryT = "SELECT Cod_Restaurante FROM Restaurante WHERE Cod_tienda = ? AND Estado = 1"
-    cursor.execute(queryT, (cod_tienda,))
-    tienda = cursor.fetchone()
-   
-
-    if not tienda:
+    # 2) Obtener info de la tienda nueva (Cod_Restaurante, Cod_Cadena) y checar que esté activa
+    cursor.execute(
+        "SELECT Cod_Restaurante, Cod_Cadena FROM Restaurante WHERE Cod_Tienda = ? AND Estado = 1",
+        (cod_tienda,)
+    )
+    tienda_row = cursor.fetchone()
+    if not tienda_row:
         await update.message.reply_text("El centro de costo no está activo o no existe. Inténtalo nuevamente.")
-        return ASK_COD_TIENDA  
+        return ASK_COD_TIENDA
 
-    queryU = "SELECT Cod_Usuario FROM users WHERE Usuario = ?"
-    cursor.execute(queryU, (context.user_data["user"],))
-    usuario = cursor.fetchone()
+    tienda_cod_restaurante, nuevo_cod_cadena = tienda_row
+    print(f"DEBUG -> tienda_cod_restaurante={tienda_cod_restaurante}, nuevo_cod_cadena={nuevo_cod_cadena}")
+
+    # 3) Obtener cod_cadena actual del usuario objetivo (tomamos TOP 1 por si tiene varios; ajusta si necesitas otra lógica)
+    actualcod_cadenasql = """
+        SELECT TOP 1 r.cod_cadena
+        FROM Restaurante r
+        JOIN UserRestaurante ur ON r.Cod_Restaurante = ur.Cod_Restaurante 
+        JOIN Users u ON ur.Cod_Usuario = u.Cod_Usuario
+        WHERE u.Usuario = ?;
+    """
+    cursor.execute(actualcod_cadenasql, (context.user_data["user"],))
+    row = cursor.fetchone()
+    actual_cod_cadena = row[0] if row else None
+    print(f"DEBUG Actual cod_cadena: {actual_cod_cadena}")
+
+    # 4) Perfil del usuario (normalizado)
+    perfil = context.user_data.get("perfil")
+    perfil_norm = perfil.strip().lower() if isinstance(perfil, str) else None
+    print(f"DEBUG Perfil obtenido: {repr(perfil)} -> normalizado: {perfil_norm}")
+
+    # 5) Validación estricta para Gerente Local / Gerente Tienda
+    if perfil_norm in ("gerente local", "gerente tienda"):
+        # asegurar enteros y existencia
+        try:
+            actual_cod_cadena = int(actual_cod_cadena)
+            nuevo_cod_cadena = int(nuevo_cod_cadena)
+        except (TypeError, ValueError):
+            await update.message.reply_text("⛔ No se pudo validar el código de cadena. Intenta nuevamente.")
+            return ASK_COD_TIENDA
+
+        pares_permitidos = {(10, 11), (11, 10), (36, 37), (37, 36)}
+        cambio_permitido = (
+            nuevo_cod_cadena == actual_cod_cadena or
+            (actual_cod_cadena, nuevo_cod_cadena) in pares_permitidos
+        )
+
+        print(f"DEBUG cambio_permitido={cambio_permitido} (actual={actual_cod_cadena}, nuevo={nuevo_cod_cadena})")
+
+        if not cambio_permitido:
+            await update.message.reply_text(
+                "⛔ Solo se puede agregar entre centros de la misma cadena, "
+                "o entre cadenas KFC y HeladeriasKFC, o entre BaskinRobins y Cinnabon. Intenta nuevamente."
+            )
+            return ASK_COD_TIENDA  # <-- detiene la ejecución aquí
+
+    # 6) Obtener Cod_Usuario del usuario objetivo
+    cursor.execute("SELECT Cod_Usuario FROM Users WHERE Usuario = ?", (context.user_data["user"],))
+    usuario_row = cursor.fetchone()
+    if not usuario_row:
+        await update.message.reply_text("⛔ Usuario objetivo no encontrado en la base de datos.")
+        return ASK_COD_TIENDA
+    usuario_id = usuario_row[0]
 
     try:
-        
-        codTienda = """SELECT cod_restaurante FROM Restaurante WHERE cod_tienda = ?"""
-        cursor.execute(codTienda, (cod_tienda,))  
-        TiendaC = cursor.fetchone()
-        if TiendaC:
-            TiendaC = TiendaC[0]  
-       
-        
-        codUsuario = """Select cod_usuario From Users where Usuario= ?"""
-        cursor.execute(codUsuario,(context.user_data['username']))
-        UsuarioM = cursor.fetchone()
-            
-        if UsuarioM:  
-                UsuarioM = UsuarioM[0] 
+        # 7) Usuario que realiza la acción (modificador)
+        modificador_usuario = context.user_data.get('username') or (update.effective_user.username if update.effective_user else None)
+        mod_id = None
+        if modificador_usuario:
+            cursor.execute("SELECT cod_usuario FROM Users WHERE Usuario = ?", (modificador_usuario,))
+            mod_row = cursor.fetchone()
+            mod_id = mod_row[0] if mod_row else None
 
-                insert_query2 = """
+        # 8) Insertar en AuditLog si tenemos un modificador
+        if mod_id:
+            insert_query2 = """
                 INSERT INTO AuditLog (Cod_Restaurante, Cod_Usuario, Accion, Modificador, Fecha_Log) 
                 VALUES (?, ?, ?, ?, GETDATE())
-                """
-                cursor.execute(
-                    insert_query2,
-                    (
-                        TiendaC,
-                        usuario[0], 
-                        "Bot agrego un centro",
-                        UsuarioM  
-                    ),
+            """
+            cursor.execute(insert_query2, (tienda_cod_restaurante, usuario_id, "Bot agrego un centro", mod_id))
+            db_connection.commit()
 
-                )
-                db_connection.commit()
-                
-        insert_query = """INSERT INTO UserRestaurante (Cod_Usuario, Cod_Restaurante) VALUES (?, ?)"""
-        cursor.execute(insert_query, (usuario[0], tienda[0]))
+        # 9) Insertar el centro de costo
+        insert_query = "INSERT INTO UserRestaurante (Cod_Usuario, Cod_Restaurante) VALUES (?, ?)"
+        cursor.execute(insert_query, (usuario_id, tienda_cod_restaurante))
         db_connection.commit()
-        
-        await update.message.reply_text(f"✅ Centro de costo agregado con éxito.\nAl usuario {context.user_data['user'],} se le agregó el centro de costo: {cod_tienda}")
-        
+
         await update.message.reply_text(
-                "¿Desea continuar con otro proceso?",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Realizar otro proceso", callback_data="again")],
-                    [InlineKeyboardButton("🚪 Cerrar sesión", callback_data="End")]
-                ])
-            )
+            f"✅ Centro de costo agregado con éxito.\n"
+            f"Al usuario {context.user_data['user']} se le agregó el centro de costo: {cod_tienda}"
+        )
+
+        await update.message.reply_text(
+            "¿Desea continuar con otro proceso?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Realizar otro proceso", callback_data="again")],
+                [InlineKeyboardButton("🚪 Cerrar sesión", callback_data="End")]
+            ])
+        )
         return ASK_FINAL
 
     except Exception as e:
         db_connection.rollback()
         await update.message.reply_text(f"Error al agregar el centro de costo: {str(e)}.")
         return ASK_COD_TIENDA
-    
+
 
 #########--------------------------------------------------------------Validacion de centro de costo para el cambio-------------------------------------------------------------------------------------------------
 async def handle_centro_costo(update: Update, context: CallbackContext):
